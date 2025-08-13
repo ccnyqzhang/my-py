@@ -1,0 +1,186 @@
+# GaAs FP semiconductor laser simulation
+# Waveguide: AlGaAs, QW: InGaAs
+# 支持：
+#  - 修改前/后镜反射率 R1, R2 (AR / HR)
+#  - 线性稳态模型 (P vs I)
+#  - 时间域速率方程 (可选，显式 Euler 时间步进求稳态)
+#  - 导出数据为 CSV
+#  - 绘图并保存
+
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+import csv
+
+# ---------------------- 可调参数 ----------------------
+# 几何与光学
+wavelength = 980e-9       # m
+L = 5000e-6                # 腔长 m
+width = 200e-6              # 波导宽度 m
+thickness = 0.1e-6        # 有效活性层厚度 m
+V = L * width * thickness # 有源体积 m^3
+
+# 反射率（可调）
+R1 = 0.01   # 前镜 (AR)
+R2 = 0.95   # 后镜 (HR)
+
+# 材料/器件参数（根据需要调整）
+alpha_i = 1000.0     # 内损耗 1/m (e.g., 1000 1/m = 10 cm^-1)
+Gamma = 0.03         # 约束因子
+g0 = 1e-20           # 线性差分增益 [m^3]
+N_tr = 1e24          # 透明载流子密度 [m^-3]
+v_g = 299792458 / 3.6# 群速度 (m/s)
+
+# 电学/动力学参数
+tau_n = 1e-9         # 载流子寿命 s
+eta_inj = 0.9        # 注入效率
+beta_sp = 1e-5       # 自发耦合因子
+q = 1.602176634e-19  # 元电荷 C
+h = 6.62607015e-34   # 普朗克常数
+c = 299792458        # 光速
+
+# 仿真选项
+I_max_factor = 5.0   # 最大电流为 Ith * factor
+num_points = 400     # P vs I 的采样点数
+use_rate_eq = True   # 是否同时运行时间域速率方程以验证稳态
+export_csv = True    # 是否导出 CSV
+csv_filename = "P_vs_I_results.csv"
+
+# ---------------------- 函数 ----------------------
+
+def mirror_loss(R1, R2, L):
+    # alpha_m 来自镜面损耗公式
+    # 注意：如果 R1*R2 >=1 会出现数学错误，需保证反射率在 [0,1)
+    if R1 <= 0 or R2 <= 0:
+        return np.inf
+    return (1.0 / (2.0 * L)) * np.log(1.0 / (R1 * R2))
+
+
+def threshold_params(R1, R2):
+    alpha_m = mirror_loss(R1, R2, L)
+    alpha_tot = alpha_i + alpha_m
+    g_th = alpha_tot / Gamma
+    N_th = g_th / g0 + N_tr
+    I_th = q * V * N_th / (tau_n * eta_inj)
+    eta_slope = (h * c / wavelength / q) * eta_inj * (alpha_m / alpha_tot)
+    tau_p = 1.0 / (v_g * alpha_tot)
+    return {
+        'alpha_m': alpha_m,
+        'alpha_tot': alpha_tot,
+        'g_th': g_th,
+        'N_th': N_th,
+        'I_th': I_th,
+        'eta_slope': eta_slope,
+        'tau_p': tau_p
+    }
+
+
+def pvI_linear(R1, R2, I_array):
+    # 线性稳态模型：低于阈值给出微小自发功率，高于阈值线性上升
+    params = threshold_params(R1, R2)
+    I_th = params['I_th']
+    eta_slope = params['eta_slope']
+    P = np.zeros_like(I_array)
+    for i, cur in enumerate(I_array):
+        if cur <= I_th:
+            P[i] = (h * c / wavelength) * beta_sp * eta_inj * cur / q
+        else:
+            P[i] = eta_slope * (cur - I_th)
+    return P, params
+
+
+def simulate_rate_equations(R1, R2, I_bias, t_end=5e-9, dt=1e-13):
+    # 简单显式 Euler 时间步进解两个速率方程：载流子密度 N(t) 和光子数 S(t)
+    # dN/dt = (eta_inj*I/q/V) - N/tau_n - v_g * g(N) * S * Gamma
+    # dS/dt = Gamma * v_g * g(N) * S - S / tau_p + beta_sp * N / tau_n * V_sp
+    # 其中我们用规范化光子数 S -> 表征腔内光功率的量 (photon number), 近似转换在输出时用镜面损耗
+    params = threshold_params(R1, R2)
+    alpha_tot = params['alpha_tot']
+    tau_p = 1.0 / (v_g * alpha_tot)
+    alpha_m = params['alpha_m']
+
+    # 初始条件
+    N = params['N_th'] * 0.5
+    S = 1e3
+
+    time_steps = int(max(2, math.ceil(t_end / dt)))
+    N_trace = np.zeros(time_steps)
+    S_trace = np.zeros(time_steps)
+    t_trace = np.linspace(0, t_end, time_steps)
+
+    for k in range(time_steps):
+        # gain (线性模型)
+        gN = g0 * (N - N_tr)
+        if gN < 0:
+            gN = 0.0
+        # 驱动项 (A -> carriers per second per volume)
+        R_inj = eta_inj * I_bias / (q * V)
+        dN = R_inj - N / tau_n - v_g * gN * S * Gamma
+        dS = Gamma * v_g * gN * S - S / tau_p + beta_sp * N / tau_n
+        N = N + dN * dt
+        S = S + dS * dt
+        if N < 0: N = 0.0
+        if S < 0: S = 0.0
+        N_trace[k] = N
+        S_trace[k] = S
+
+    # 将腔内光子数 S 转换为输出光功率 P_out：P_out = h*nu * S * (v_g * alpha_m) * (1/2??)
+    # 这里采用近似：输出功率约等于 h*nu * S * v_g * alpha_m
+    # 这是一个粗略估算，主要用于与线性稳态结果比较趋势
+    P_out = (h * c / wavelength) * S * v_g * alpha_m
+    return t_trace, N_trace, S_trace, P_out
+
+# ---------------------- 运行并绘图 ----------------------
+I_th_example = threshold_params(R1, R2)['I_th']
+I_array = np.linspace(0.0, I_th_example * I_max_factor, num_points)
+P_linear, params = pvI_linear(R1, R2, I_array)
+
+plt.figure(figsize=(8,5))
+plt.plot(I_array, P_linear, label='Linear steady-state P(I)')
+plt.axvline(params['I_th'], color='gray', linestyle='--', label=f"I_th={params['I_th']:.3e} A")
+plt.xlabel('Injection current (A)')
+plt.ylabel('Output power (W)')
+plt.title(f'GaAs FP Laser Simulation: λ={wavelength*1e9:.0f} nm, L={L*1e6:.0f} µm, R1={R1:.3f}, R2={R2:.3f}')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# 可选：用速率方程验证若干点（比如 I = 0.5*Ith, Ith, 2*Ith）
+if use_rate_eq:
+    test_Is = [0.5 * params['I_th'], params['I_th'], 2.0 * params['I_th']]
+    fig, axs = plt.subplots(len(test_Is), 1, figsize=(8, 3*len(test_Is)))
+    for idx, Itest in enumerate(test_Is):
+        t, Ntr, Str, P_est = simulate_rate_equations(R1, R2, Itest, t_end=5e-8, dt=2e-13)
+        ax = axs[idx] if len(test_Is) > 1 else axs
+        ax.plot(t*1e9, Ntr, label='N(t)')
+        ax.plot(t*1e9, Str, label='S(t)')
+        ax2 = ax.twinx()
+        ax2.plot(t*1e9, np.full_like(t, P_est), 'k--', label='Estimated steady P (single value)')
+        ax.set_xlabel('Time (ns)')
+        ax.set_ylabel('N or S')
+        ax2.set_ylabel('P_out (W)')
+        ax.set_title(f'I = {Itest:.3e} A')
+        ax.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+    plt.tight_layout()
+    plt.show()
+
+# 导出 CSV
+if export_csv:
+    with open(csv_filename, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['I_A', 'P_W'])
+        for i, p in zip(I_array, P_linear):
+            writer.writerow([i, p])
+    print(f"Saved P vs I table to {csv_filename}")
+
+# 打印阈值等关键数据
+print('\n--- Threshold & derived parameters ---')
+for k, v in params.items():
+    if isinstance(v, float):
+        print(f"{k}: {v:.6e}")
+    else:
+        print(f"{k}: {v}")
+
+print('\n说明：\n - 这是一个教育/工程级别的仿真代码，反映增益-损耗平衡的基本行为。\n - 若需更高精度，请提供或修改 g0、N_tr、alpha_i、Gamma、以及多 QW/电学模型参数。\n - 你可以在 canvas 中直接编辑并运行这个脚本（在你的本地 Python 环境或 notebook 中）。')
